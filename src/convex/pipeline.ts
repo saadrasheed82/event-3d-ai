@@ -5,19 +5,37 @@ import { internal } from "./_generated/api";
 import { internalAction, type ActionCtx } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
 
-const GEN_BASE = "https://gen.pollinations.ai/v1";
-const IMG_BASE = "https://image.pollinations.ai/prompt";
-const OPENVERSE_BASE = "https://api.openverse.org/v1/images";
+// ---------------------------------------------------------------------------
+// Providers
+//  - Text:  Experiential Labs (OpenAI-compatible) — extraction + planning
+//  - Image: Pollinations `gpt-image-2` — infographic turnaround sheets
+//  - Refs:  Tavily search API — real-world reference images
+//
+// Keys are read from env first (set them in the Keys/API keys tab); the
+// fallbacks below keep local dev working. This file is "use node" and is
+// never bundled into the client.
+// ---------------------------------------------------------------------------
 
-const DEFAULT_TEXT_MODEL =
-  process.env.POLLINATIONS_TEXT_MODEL || "openai/gpt-5.4-nano";
-const IMAGE_MODEL = process.env.POLLINATIONS_IMAGE_MODEL || "flux";
+const XPL_BASE =
+  process.env.EXPERIENTIAL_LABS_BASE_URL || "https://api.experientiallabs.ai/v1";
+const XPL_KEY =
+  process.env.EXPERIENTIAL_LABS_API_KEY ||
+  "xpl_c0b44004186943a022962aed605ccab09f20f6cb";
+const XPL_MODEL = process.env.EXPERIENTIAL_LABS_MODEL || "gpt-5.6-luna";
+
+const IMG_BASE = "https://image.pollinations.ai/prompt";
+const POLLINATIONS_KEY =
+  process.env.POLLINATIONS_API_KEY ||
+  "sk_WMmdKRZBaoECiwyS8S1csNgFJbGlE140";
+const IMAGE_MODEL = "gpt-image-2"; // fixed per product decision
+
+const TAVILY_KEY =
+  process.env.TAVILY_API_KEY || "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";
+
 const MAX_CHUNKS = 6;
 
 // ---------------------------------------------------------------------------
-// Small HTTP helpers (timeout + bounded retry; Pollinations suggests retrying
-// the same request on timeout — the seed is fixed so the retry joins the same
-// generation instead of starting a new one).
+// Small HTTP helpers (timeout + bounded retry)
 // ---------------------------------------------------------------------------
 
 async function fetchWithRetry(
@@ -48,17 +66,8 @@ async function fetchWithRetry(
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function pollinationsKey(): string | undefined {
-  return (
-    process.env.POLLINATIONS_API_KEY ||
-    process.env.POLLINATIONS_KEY ||
-    process.env.POLLINATIONS_TOKEN ||
-    undefined
-  );
-}
-
 // ---------------------------------------------------------------------------
-// Pollinations text generation (OpenAI-compatible chat completions)
+// Experiential Labs text generation (OpenAI-compatible chat completions)
 // ---------------------------------------------------------------------------
 
 type ChatMessage = {
@@ -68,42 +77,38 @@ type ChatMessage = {
 
 async function callChat(
   messages: ChatMessage[],
-  opts: { json?: boolean; maxTokens?: number } = {},
+  opts: { maxTokens?: number } = {},
 ): Promise<string> {
-  const key = pollinationsKey();
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  if (key) headers.Authorization = `Bearer ${key}`;
-
-  const res = await fetchWithRetry(`${GEN_BASE}/chat/completions`, {
+  const res = await fetchWithRetry(`${XPL_BASE}/chat/completions`, {
     method: "POST",
-    headers,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${XPL_KEY}`,
+    },
     body: JSON.stringify({
-      model: DEFAULT_TEXT_MODEL,
+      model: XPL_MODEL,
       messages,
       temperature: 0.4,
       max_tokens: opts.maxTokens ?? 2200,
-      ...(opts.json ? { response_format: { type: "json_object" } } : {}),
     }),
   });
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(
-      `Pollinations chat failed (${res.status}): ${body.slice(0, 300)}`,
+      `Experiential Labs chat failed (${res.status}): ${body.slice(0, 300)}`,
     );
   }
   const data = (await res.json()) as {
     choices?: { message?: { content?: string } }[];
   };
   const text = data.choices?.[0]?.message?.content;
-  if (!text) throw new Error("Pollinations chat returned no content");
+  if (!text) throw new Error("LLM returned no content");
   return text;
 }
 
 async function callChatJson<T>(messages: ChatMessage[]): Promise<T> {
-  const raw = await callChat(messages, { json: true });
+  const raw = await callChat(messages);
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
   if (start === -1 || end === -1) throw new Error("Model returned no JSON");
@@ -111,7 +116,7 @@ async function callChatJson<T>(messages: ChatMessage[]): Promise<T> {
 }
 
 // ---------------------------------------------------------------------------
-// Reference image search via Openverse (no API key needed)
+// Reference image search via Tavily
 // ---------------------------------------------------------------------------
 
 async function findReferenceImages(
@@ -119,17 +124,27 @@ async function findReferenceImages(
   count = 4,
 ): Promise<string[]> {
   try {
-    const url = `${OPENVERSE_BASE}?q=${encodeURIComponent(query)}&page_size=${count}&license_type=commercial&size=large`;
-    const res = await fetch(url, {
-      headers: { Accept: "application/json", "User-Agent": "Event3D/1.0" },
-    });
+    const res = await fetchWithRetry(
+      "https://api.tavily.com/search",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${TAVILY_KEY}`,
+        },
+        body: JSON.stringify({
+          query,
+          include_images: true,
+          max_results: 3,
+          search_depth: "basic",
+        }),
+      },
+      2,
+    );
     if (!res.ok) return [];
-    const data = (await res.json()) as {
-      results?: { url?: string; thumbnail?: string }[];
-    };
-    return (data.results ?? [])
-      .map((r) => r.url || r.thumbnail || "")
-      .filter((u) => u.startsWith("http"))
+    const data = (await res.json()) as { images?: string[] };
+    return (data.images ?? [])
+      .filter((u) => typeof u === "string" && u.startsWith("http"))
       .slice(0, count);
   } catch {
     return []; // refs are best-effort; never block the pipeline
@@ -137,16 +152,18 @@ async function findReferenceImages(
 }
 
 // ---------------------------------------------------------------------------
-// Pollinations image generation — one infographic sheet with all sides
+// Pollinations gpt-image-2 — one infographic sheet with all sides.
+// The generated bytes are downloaded and stored in Convex storage, so the
+// browser never needs (or sees) the Pollinations key.
 // ---------------------------------------------------------------------------
 
 async function generateSheet(
+  ctx: ActionCtx,
   prompt: string,
   seed: number,
   width = 1536,
   height = 1024,
-): Promise<string> {
-  const key = pollinationsKey();
+): Promise<Id<"_storage">> {
   const params = new URLSearchParams({
     model: IMAGE_MODEL,
     width: String(width),
@@ -154,8 +171,8 @@ async function generateSheet(
     seed: String(seed),
     nologo: "true",
     safe: "false",
+    key: POLLINATIONS_KEY,
   });
-  if (key) params.set("key", key);
 
   const url = `${IMG_BASE}/${encodeURIComponent(prompt)}?${params.toString()}`;
   const res = await fetchWithRetry(url, { method: "GET" }, 3);
@@ -167,7 +184,7 @@ async function generateSheet(
   }
   const blob = await res.blob();
   if (blob.size < 2048) throw new Error("Image response too small");
-  return url;
+  return await ctx.storage.store(blob);
 }
 
 // ---------------------------------------------------------------------------
@@ -182,11 +199,11 @@ function extractionMessages(brief: string): ChatMessage[] {
     {
       role: "system",
       content:
-        "You are a 3D visualization lead at an event production company. From the raw client brief, extract ONLY information needed to build a 3D model of the event. Ignore catering menus, pricing, contracts, guest lists, scheduling, entertainment bookings, marketing copy, and anything else that does not affect geometry, staging, layout, materials, colors, lighting, AV placement, or branding surfaces. If a field is not mentioned, omit it.",
+        "You are a 3D visualization lead at an event production company. From the raw client brief, extract ONLY information needed to build a 3D model of the event. Ignore catering menus, pricing, contracts, guest lists, scheduling, entertainment bookings, marketing copy, and anything else that does not affect geometry, staging, layout, materials, colors, lighting, AV placement, or branding surfaces. If a field is not mentioned, omit it. Reply with JSON only — no prose, no markdown fences.",
     },
     {
       role: "user",
-      content: `Brief:\n"""\n${brief}\n"""\n\nReturn strict JSON with this exact shape (omit unknown fields, keep strings concise):\n{"eventName":string,"eventType":string,"venue":string,"dimensions":string,"staging":string,"lighting":string,"av":string,"seating":string,"branding":string,"layoutNotes":string,"objects":string[],"ignored":string}`,
+      content: `Brief:\n"""\n${brief}\n"""\n\nReturn JSON with this exact shape (omit unknown fields, keep strings concise):\n{"eventName":string,"eventType":string,"venue":string,"dimensions":string,"staging":string,"lighting":string,"av":string,"seating":string,"branding":string,"layoutNotes":string,"objects":string[],"ignored":string}`,
     },
   ];
 }
@@ -196,11 +213,11 @@ function planningMessages(brief: string, extractedJson: string): ChatMessage[] {
     {
       role: "system",
       content:
-        "You are planning the build of one 3D event model. Split the 3D-relevant scope into an ordered list of 3 to 6 chunks (parts of the same single event model) that can each be modeled one at a time. Each chunk must cover distinct physical parts of the venue; together they must cover the whole event. Do not include tasks like files, exports, reviews, or meetings — only physical/geometric scope.",
+        "You are planning the build of one 3D event model. Split the 3D-relevant scope into an ordered list of 3 to 6 chunks (parts of the same single event model) that can each be modeled one at a time. Each chunk must cover distinct physical parts of the venue; together they must cover the whole event. Do not include tasks like files, exports, reviews, or meetings — only physical/geometric scope. Reply with JSON only — no prose, no markdown fences.",
     },
     {
       role: "user",
-      content: `Brief:\n"""\n${brief}\n"""\n\nExtracted 3D info:\n${extractedJson}\n\nReturn strict JSON:\n{"chunks":[{"name":string,"goal":string,"spec":string}]}\n"spec" must be a detailed modeling instruction for that part: geometry, approximate dimensions, materials, colors, placement relative to the venue, and any branding/graphics to apply.`,
+      content: `Brief:\n"""\n${brief}\n"""\n\nExtracted 3D info:\n${extractedJson}\n\nReturn JSON:\n{"chunks":[{"name":string,"goal":string,"spec":string}]}\n"spec" must be a detailed modeling instruction for that part: geometry, approximate dimensions, materials, colors, placement relative to the venue, and any branding/graphics to apply.`,
     },
   ];
 }
@@ -252,7 +269,6 @@ export const runPipeline = internalAction({
     const brief = await ctx.runQuery(internal.briefs.getInternal, { briefId });
     if (!brief) throw new Error(`Brief ${briefId} not found`);
 
-    const now = Date.now();
     try {
       // ---- Stage 1: extract 3D-only info --------------------------------
       await ctx.runMutation(internal.briefs.setStatus, {
@@ -306,7 +322,7 @@ export const runPipeline = internalAction({
         const chunk = await ctx.runQuery(internal.briefs.getChunkByIndex, {
           briefId,
           index: slot,
-          });
+        });
         if (!chunk) continue;
 
         const sheetPrompt = chunkSheetPrompt(
@@ -316,58 +332,71 @@ export const runPipeline = internalAction({
           def.spec,
         );
 
-        // Reference images (best effort)
-        await ctx.runMutation(internal.briefs.setChunkStatus, {
-          chunkId: chunk._id,
-          status: "finding_refs",
-        });
-        const refQuery = `${chunk.name} ${chunk.goal} event production stage design`
-          .replace(/[^a-zA-Z0-9 ]/g, " ")
-          .slice(0, 120);
-        const refs = await findReferenceImages(refQuery, 4);
-        await ctx.runMutation(internal.briefs.setChunkRefs, {
-          chunkId: chunk._id,
-          refs,
-        });
+        try {
+          // Reference images (best effort)
+          await ctx.runMutation(internal.briefs.setChunkStatus, {
+            chunkId: chunk._id,
+            status: "finding_refs",
+          });
+          const refQuery = `${chunk.name} ${chunk.goal} event production stage design`
+            .replace(/[^a-zA-Z0-9 ]/g, " ")
+            .slice(0, 120);
+          const refs = await findReferenceImages(refQuery, 4);
+          await ctx.runMutation(internal.briefs.setChunkRefs, {
+            chunkId: chunk._id,
+            refs,
+          });
 
-        // Generate the all-sides infographic sheet
-        await ctx.runMutation(internal.briefs.setChunkStatus, {
-          chunkId: chunk._id,
-          status: "generating",
-        });
-        const seed = (hashString(briefId + chunk.name) % 900000) + 1000;
-        const sheetUrl = await generateSheet(sheetPrompt, seed);
-        await ctx.runMutation(internal.briefs.setChunkSheet, {
-          chunkId: chunk._id,
-          sheetUrl,
-          prompt: sheetPrompt,
-        });
+          // Generate the all-sides infographic sheet
+          await ctx.runMutation(internal.briefs.setChunkStatus, {
+            chunkId: chunk._id,
+            status: "generating",
+          });
+          const seed = (hashString(briefId + chunk.name) % 900000) + 1000;
+          const storageId = await generateSheet(ctx, sheetPrompt, seed);
+          await ctx.runMutation(internal.briefs.setChunkSheet, {
+            chunkId: chunk._id,
+            storageId,
+            prompt: sheetPrompt,
+          });
 
-        chunkSheetPrompts.push({ name: chunk.name, prompt: sheetPrompt });
-        done += 1;
-        await ctx.runMutation(internal.briefs.setProgress, {
-          briefId,
-          chunksDone: done,
-        });
+          chunkSheetPrompts.push({ name: chunk.name, prompt: sheetPrompt });
+          done += 1;
+          await ctx.runMutation(internal.briefs.setProgress, {
+            briefId,
+            chunksDone: done,
+          });
+        } catch (chunkErr) {
+          // One bad chunk must not sink the whole brief
+          await ctx.runMutation(internal.briefs.setChunkStatus, {
+            chunkId: chunk._id,
+            status: "failed",
+            error:
+              chunkErr instanceof Error
+                ? chunkErr.message
+                : "Unknown chunk error",
+          });
+        }
       }
 
       if (done === 0) throw new Error("No chunk could be rendered");
 
       // ---- Summary sheet -------------------------------------------------
-      const summaryUrl = await generateSheet(
+      const summaryStorageId = await generateSheet(
+        ctx,
         summarySheetPrompt(
           String(extracted.eventName ?? brief.title),
           chunkSheetPrompts,
           String(extracted.layoutNotes ?? ""),
         ),
         (hashString(briefId) % 900000) + 1000,
-        1792,
+        1536,
         1024,
       );
 
       await ctx.runMutation(internal.briefs.finish, {
         briefId,
-        sheetUrl: summaryUrl,
+        storageId: summaryStorageId,
       });
     } catch (err) {
       const message =

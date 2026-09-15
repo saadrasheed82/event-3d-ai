@@ -78,11 +78,25 @@ function StatusChip({
   );
 }
 
-function SheetImage({ src, alt }: { src: string; alt: string }) {
+function SheetImage({
+  storageId,
+  alt,
+}: {
+  storageId: Id<"_storage">;
+  alt: string;
+}) {
+  const url = useQuery(api.briefs.sheetUrl, { storageId });
+  if (!url) {
+    return (
+      <div className="flex h-40 items-center justify-center rounded-2xl bg-muted/60 clay-press">
+        <Loader2 className="size-5 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
   return (
-    <a href={src} target="_blank" rel="noopener noreferrer" className="block">
+    <a href={url} target="_blank" rel="noopener noreferrer" className="block">
       <img
-        src={src}
+        src={url}
         alt={alt}
         loading="lazy"
         className="w-full rounded-2xl bg-white object-cover clay-sm transition-transform hover:-translate-y-0.5"
@@ -362,7 +376,7 @@ export default function Dashboard() {
                 </div>
 
                 {/* Master sheet */}
-                {brief.sheetUrl && (
+                {brief.sheetStorageId && (
                   <div className="clay-sheen clay rounded-[2rem] bg-white/85 p-6">
                     <div className="flex items-center gap-3">
                       <span className="flex size-10 items-center justify-center rounded-2xl bg-clay-mint clay-sm">
@@ -378,7 +392,10 @@ export default function Dashboard() {
                       </div>
                     </div>
                     <div className="mt-4">
-                      <SheetImage src={brief.sheetUrl} alt="Master 3D model sheet" />
+                      <SheetImage
+                        storageId={brief.sheetStorageId}
+                        alt="Master 3D model sheet"
+                      />
                     </div>
                   </div>
                 )}
@@ -413,6 +430,13 @@ export default function Dashboard() {
                           {chunk.spec}
                         </p>
 
+                        {chunk.status === "failed" && chunk.error && (
+                          <p className="mt-3 flex items-start gap-2 rounded-2xl bg-clay-coral/10 p-3 text-sm font-semibold text-destructive">
+                            <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                            {chunk.error}
+                          </p>
+                        )}
+
                         {chunk.refs && chunk.refs.length > 0 && (
                           <div className="mt-3">
                             <p className="flex items-center gap-1.5 text-xs font-extrabold tracking-wide text-muted-foreground uppercase">
@@ -435,10 +459,10 @@ export default function Dashboard() {
                           </div>
                         )}
 
-                        {chunk.sheetUrl && (
+                        {chunk.sheetStorageId && (
                           <div className="mt-4">
                             <SheetImage
-                              src={chunk.sheetUrl}
+                              storageId={chunk.sheetStorageId}
                               alt={`${chunk.name} turnaround sheet`}
                             />
                           </div>

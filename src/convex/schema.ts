@@ -78,7 +78,7 @@ const schema = defineSchema(
       })),
       chunksPlanned: v.optional(v.number()),
       chunksDone: v.optional(v.number()),
-      sheetUrl: v.optional(v.string()),
+      sheetStorageId: v.optional(v.id("_storage")),
       createdAt: v.number(),
       updatedAt: v.number(),
     })
@@ -95,7 +95,7 @@ const schema = defineSchema(
       status: chunkStatus,
       error: v.optional(v.string()),
       attempts: v.optional(v.number()),
-      sheetUrl: v.optional(v.string()),
+      sheetStorageId: v.optional(v.id("_storage")),
       prompt: v.optional(v.string()),
     })
       .index("by_brief", ["briefId", "index"])

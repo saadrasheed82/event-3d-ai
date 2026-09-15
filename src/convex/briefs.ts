@@ -7,7 +7,6 @@ import {
 } from "./_generated/server";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { internal } from "./_generated/api";
-
 // ---------------------------------------------------------------------------
 // Public queries (signed-in user's own briefs)
 // ---------------------------------------------------------------------------
@@ -94,6 +93,16 @@ export const remove = mutation({
     }
     await ctx.db.delete(briefId);
   },
+});
+
+// Resolve a storage id to a browser-usable URL (owner-scoped).
+export const sheetUrl = query({
+  args: { storageId: v.id("_storage") },
+  handler: async (ctx, { storageId }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) return null;
+    return await ctx.storage.getUrl(storageId);
+    },
 });
 
 // ---------------------------------------------------------------------------
@@ -197,9 +206,10 @@ export const setChunkStatus = internalMutation({
       v.literal("done"),
       v.literal("failed"),
     ),
+    error: v.optional(v.string()),
   },
-  handler: async (ctx, { chunkId, status }) => {
-    await ctx.db.patch(chunkId, { status });
+  handler: async (ctx, { chunkId, status, error }) => {
+    await ctx.db.patch(chunkId, { status, error });
   },
 });
 
@@ -216,12 +226,12 @@ export const setChunkRefs = internalMutation({
 export const setChunkSheet = internalMutation({
   args: {
     chunkId: v.id("chunks"),
-    sheetUrl: v.string(),
+    storageId: v.id("_storage"),
     prompt: v.string(),
   },
-  handler: async (ctx, { chunkId, sheetUrl, prompt }) => {
+  handler: async (ctx, { chunkId, storageId, prompt }) => {
     await ctx.db.patch(chunkId, {
-      sheetUrl,
+      sheetStorageId: storageId,
       prompt,
       status: "done",
     });
@@ -241,12 +251,12 @@ export const setProgress = internalMutation({
 export const finish = internalMutation({
   args: {
     briefId: v.id("briefs"),
-    sheetUrl: v.string(),
+    storageId: v.id("_storage"),
   },
-  handler: async (ctx, { briefId, sheetUrl }) => {
+  handler: async (ctx, { briefId, storageId }) => {
     await ctx.db.patch(briefId, {
       status: "done",
-      sheetUrl,
+      sheetStorageId: storageId,
       updatedAt: Date.now(),
     });
   },
