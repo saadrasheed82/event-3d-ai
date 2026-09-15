@@ -9,17 +9,20 @@ import { cn } from "@/lib/utils";
 import {
   AlertTriangle,
   ArrowRight,
-  Box,
   CheckCircle2,
   FileText,
   Images,
   Loader2,
   LogOut,
-  RotateCcw,
+  Paperclip,
   Sparkles,
   Trash2,
+  X,
 } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
+import type { Doc } from "@/convex/_generated/dataModel";
+
+type AttachmentDoc = Doc<"attachments">;
 import { Link, useNavigate } from "react-router";
 
 const BRIEF_STATUS: Record<string, { label: string; className: string }> = {
@@ -105,6 +108,62 @@ function SheetImage({
   );
 }
 
+const ACCEPTED = ".pdf,.doc,.docx,.txt,.md,.csv,.rtf,image/*";
+const MAX_FILE_MB = 15;
+
+function PendingFileList({
+  files,
+  onRemove,
+}: {
+  files: File[];
+  onRemove: (idx: number) => void;
+}) {
+  if (files.length === 0) return null;
+  return (
+    <div className="mt-3 flex flex-col gap-2">
+      {files.map((f, i) => (
+        <div
+          key={`${f.name}-${i}`}
+          className="flex items-center justify-between gap-2 rounded-2xl bg-muted/60 px-3 py-2"
+        >
+          <span className="flex min-w-0 items-center gap-2">
+            <Paperclip className="size-3.5 shrink-0 text-muted-foreground" />
+            <span className="truncate text-xs font-semibold">{f.name}</span>
+            <span className="shrink-0 text-[11px] text-muted-foreground">
+              {(f.size / 1024 / 1024).toFixed(1)} MB
+            </span>
+          </span>
+          <button
+            type="button"
+            aria-label={`Remove ${f.name}`}
+            onClick={() => onRemove(i)}
+            className="rounded-full p-1 text-muted-foreground/60 hover:bg-clay-coral/10 hover:text-destructive"
+          >
+            <X className="size-3.5" />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AttachmentChip({ attachment }: { attachment: AttachmentDoc }) {
+  const url = useQuery(api.briefs.attachmentUrl, {
+    storageId: attachment.storageId,
+  });
+  return (
+    <a
+      href={url ?? undefined}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="clay-sm inline-flex max-w-full items-center gap-1.5 rounded-full bg-clay-sky/20 px-3 py-1.5 text-xs font-bold text-[#20506f] transition-transform hover:-translate-y-0.5"
+    >
+      <Paperclip className="size-3.5 shrink-0" />
+      <span className="truncate">{attachment.name}</span>
+    </a>
+  );
+}
+
 export default function Dashboard() {
   const { user, signOut } = useAuth();
   const navigate = useNavigate();
@@ -122,32 +181,77 @@ export default function Dashboard() {
 
   const createBrief = useMutation(api.briefs.create);
   const removeBrief = useMutation(api.briefs.remove);
+  const getUploadUrl = useMutation(api.briefs.uploadAttachment);
+
+  const attachments = useQuery(
+    api.briefs.listAttachments,
+    selectedId ? { briefId: selectedId } : "skip",
+  );
 
   const [title, setTitle] = useState("");
   const [rawText, setRawText] = useState("");
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleSignOut = async () => {
     await signOut();
     navigate("/");
   };
 
+  const handleFilesPicked = (list: FileList | null) => {
+    if (!list) return;
+    const valid: File[] = [];
+    for (const f of Array.from(list)) {
+      if (f.size > MAX_FILE_MB * 1024 * 1024) {
+        setSubmitError(
+          `${f.name} is larger than ${MAX_FILE_MB} MB and was skipped.`,
+        );
+        continue;
+      }
+      valid.push(f);
+    }
+    setPendingFiles((prev) => [...prev, ...valid].slice(0, 10));
+  };
+
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    if (!rawText.trim() || submitting) return;
+    if ((!rawText.trim() && pendingFiles.length === 0) || submitting) return;
     setSubmitting(true);
     setSubmitError(null);
     try {
+      // Upload files to Convex storage first, then reference their ids.
+      const storageIds: Id<"_storage">[] = [];
+      for (const file of pendingFiles) {
+        const uploadUrl = await getUploadUrl({});
+        const res = await fetch(uploadUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": file.type || "application/octet-stream",
+          },
+          body: file,
+        });
+        if (!res.ok) throw new Error(`Upload failed for ${file.name}`);
+        const { storageId } = (await res.json()) as {
+          storageId: Id<"_storage">;
+        };
+        storageIds.push(storageId);
+      }
+
       const briefId = await createBrief({
         title: title.trim() || "Untitled event",
         rawText: rawText.trim(),
+        attachmentIds: storageIds.length > 0 ? storageIds : undefined,
       });
       setTitle("");
       setRawText("");
+      setPendingFiles([]);
       setSelectedId(briefId);
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "Failed to create brief");
+      setSubmitError(
+        err instanceof Error ? err.message : "Failed to create brief",
+      );
     } finally {
       setSubmitting(false);
     }
@@ -208,10 +312,35 @@ export default function Dashboard() {
               <Textarea
                 value={rawText}
                 onChange={(e) => setRawText(e.target.value)}
-                placeholder="The full brief goes here… stage sizes, venue, layout, materials, lighting, branding — anything and everything."
+                placeholder="The full brief goes here… stage sizes, venue, layout, materials, lighting, branding — anything and everything. Or just attach the docs."
                 rows={7}
-                required
+                required={pendingFiles.length === 0}
                 className="clay-sm mt-3 rounded-2xl border-transparent bg-muted/70 px-4 py-3 font-medium"
+              />
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept={ACCEPTED}
+                className="hidden"
+                onChange={(e) => {
+                  handleFilesPicked(e.target.files);
+                  e.target.value = "";
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="clay-sm mt-3 flex w-full items-center justify-center gap-2 rounded-2xl border-transparent bg-muted/70 px-4 py-3 text-sm font-bold text-muted-foreground transition-transform hover:-translate-y-0.5"
+              >
+                <Paperclip className="size-4" />
+                Attach PDFs, docs, images (optional)
+              </button>
+              <PendingFileList
+                files={pendingFiles}
+                onRemove={(idx) =>
+                  setPendingFiles((prev) => prev.filter((_, i) => i !== idx))
+                }
               />
               {submitError && (
                 <p className="mt-3 rounded-2xl bg-clay-coral/10 px-4 py-2 text-sm font-semibold text-destructive">
@@ -326,6 +455,20 @@ export default function Dashboard() {
                         <p className="mt-1 text-sm text-muted-foreground">
                           {brief.stageError}
                         </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {attachments && attachments.length > 0 && (
+                    <div className="mt-5">
+                      <p className="flex items-center gap-1.5 text-xs font-extrabold tracking-wide text-muted-foreground uppercase">
+                        <Paperclip className="size-3.5" />
+                        Attachments ({attachments.length})
+                      </p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {attachments.map((att) => (
+                          <AttachmentChip key={att._id} attachment={att} />
+                        ))}
                       </div>
                     </div>
                   )}

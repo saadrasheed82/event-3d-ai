@@ -7,6 +7,36 @@ import {
 } from "./_generated/server";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { internal } from "./_generated/api";
+import type { Id } from "./_generated/dataModel";
+
+// ---------------------------------------------------------------------------
+// Attachments — MIME type → how the agent consumes the file
+// ---------------------------------------------------------------------------
+
+export function attachmentKind(mimeType: string, name: string): "text" | "image" | "other" {
+  const lower = name.toLowerCase();
+  if (mimeType.startsWith("image/")) return "image";
+  if (
+    mimeType === "application/pdf" ||
+    mimeType.includes("wordprocessingml") ||
+    mimeType === "application/msword" ||
+    mimeType === "text/plain" ||
+    mimeType === "text/markdown" ||
+    mimeType === "text/csv" ||
+    mimeType === "application/rtf" ||
+    lower.endsWith(".pdf") ||
+    lower.endsWith(".docx") ||
+    lower.endsWith(".doc") ||
+    lower.endsWith(".txt") ||
+    lower.endsWith(".md") ||
+    lower.endsWith(".csv") ||
+    lower.endsWith(".rtf")
+  ) {
+    return "text";
+  }
+  return "other";
+}
+
 // ---------------------------------------------------------------------------
 // Public queries (signed-in user's own briefs)
 // ---------------------------------------------------------------------------
@@ -50,6 +80,30 @@ export const listChunks = query({
   },
 });
 
+export const listAttachments = query({
+  args: { briefId: v.id("briefs") },
+  handler: async (ctx, { briefId }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) return [];
+    const brief = await ctx.db.get(briefId);
+    if (!brief || brief.userId !== userId) return [];
+    return await ctx.db
+      .query("attachments")
+      .withIndex("by_brief", (q) => q.eq("briefId", briefId))
+      .collect();
+  },
+});
+
+// Resolve an attachment's storage id to a browser-usable URL (owner-scoped).
+export const attachmentUrl = query({
+  args: { storageId: v.id("_storage") },
+  handler: async (ctx, { storageId }) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) return null;
+    return await ctx.storage.getUrl(storageId);
+  },
+});
+
 // ---------------------------------------------------------------------------
 // Public mutations
 // ---------------------------------------------------------------------------
@@ -58,8 +112,9 @@ export const create = mutation({
   args: {
     title: v.string(),
     rawText: v.string(),
+    attachmentIds: v.optional(v.array(v.id("_storage"))),
   },
-  handler: async (ctx, { title, rawText }) => {
+  handler: async (ctx, { title, rawText, attachmentIds }) => {
     const userId = await getAuthUserId(ctx);
     if (userId === null) throw new Error("Not signed in");
     const now = Date.now();
@@ -71,9 +126,42 @@ export const create = mutation({
       createdAt: now,
       updatedAt: now,
     });
+
+    // Register pending uploads as attachments for this brief.
+    for (const storageId of attachmentIds ?? []) {
+      const meta = (await ctx.db.system.get(storageId)) as
+        | {
+            filename?: string;
+            contentType?: string;
+            size?: number;
+          }
+        | null;
+      if (!meta) continue;
+      const name = meta.filename ?? "attachment";
+      const mimeType = meta.contentType ?? "application/octet-stream";
+      await ctx.db.insert("attachments", {
+        briefId,
+        name: name.slice(0, 200),
+        mimeType,
+        size: meta.size ?? 0,
+        storageId,
+        kind: attachmentKind(mimeType, name),
+      });
+    }
+
     // Kick off the AI agent pipeline (extract → plan → refs → render)
     await ctx.scheduler.runAfter(0, internal.pipeline.runPipeline, { briefId });
     return briefId;
+  },
+});
+
+// Upload a file to Convex storage before creating the brief that references it.
+export const uploadAttachment = mutation({
+  args: { },
+  handler: async (ctx) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not signed in");
+    return await ctx.storage.generateUploadUrl();
   },
 });
 
@@ -113,6 +201,16 @@ export const getInternal = internalQuery({
   args: { briefId: v.id("briefs") },
   handler: async (ctx, { briefId }) => {
     return await ctx.db.get(briefId);
+  },
+});
+
+export const getAttachmentsInternal = internalQuery({
+  args: { briefId: v.id("briefs") },
+  handler: async (ctx, { briefId }) => {
+    return await ctx.db
+      .query("attachments")
+      .withIndex("by_brief", (q) => q.eq("briefId", briefId))
+      .collect();
   },
 });
 
@@ -180,17 +278,6 @@ export const replaceChunks = internalMutation({
       chunksDone: 0,
       updatedAt: Date.now(),
     });
-  },
-});
-
-export const getAllChunksInternal = internalQuery({
-  args: { briefId: v.id("briefs") },
-  handler: async (ctx, { briefId }) => {
-    return await ctx.db
-      .query("chunks")
-      .withIndex("by_brief", (q) => q.eq("briefId", briefId))
-      .order("asc")
-      .collect();
   },
 });
 

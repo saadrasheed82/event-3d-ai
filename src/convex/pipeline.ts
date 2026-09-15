@@ -4,6 +4,8 @@ import { v } from "convex/values";
 import { internal } from "./_generated/api";
 import { internalAction, type ActionCtx } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
+import mammoth from "mammoth";
+import { extractText, getDocumentProxy } from "unpdf";
 
 // ---------------------------------------------------------------------------
 // Providers
@@ -33,6 +35,81 @@ const TAVILY_KEY =
   process.env.TAVILY_API_KEY || "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";
 
 const MAX_CHUNKS = 6;
+
+// Max total characters of attachment text fed to the LLM.
+const MAX_ATTACHMENT_TEXT = 80_000;
+
+// ---------------------------------------------------------------------------
+// Attachment reading — extracts text from PDFs, DOCX, and plain text files.
+// Images are surfaced to the LLM as vision content, other files by name only.
+// ---------------------------------------------------------------------------
+
+type AttachmentInfo = {
+  name: string;
+  mimeType: string;
+  kind: "text" | "image" | "other";
+  storageId: Id<"_storage">;
+};
+
+async function extractTextFromBuffer(
+  buf: Buffer,
+  mimeType: string,
+  name: string,
+): Promise<string> {
+  const lower = name.toLowerCase();
+  try {
+    if (mimeType === "application/pdf" || lower.endsWith(".pdf")) {
+      const pdf = await getDocumentProxy(new Uint8Array(buf));
+      const { text } = await extractText(pdf);
+      return Array.isArray(text) ? text.join("\n") : text;
+    }
+    if (
+      mimeType.includes("wordprocessingml") ||
+      mimeType === "application/msword" ||
+      lower.endsWith(".docx") ||
+      lower.endsWith(".doc")
+    ) {
+      const { value } = await mammoth.extractRawText({ buffer: buf });
+      return value;
+    }
+    // txt, md, csv, rtf and anything else text-ish
+    return buf.toString("utf8");
+  } catch (err) {
+    console.error(`Failed to extract text from ${name}:`, err);
+    return "";
+  }
+}
+
+async function loadBriefContext(
+  ctx: ActionCtx,
+  briefId: Id<"briefs">,
+): Promise<{ text: string; images: AttachmentInfo[]; names: string[] }> {
+  const attachments = await ctx.runQuery(internal.briefs.getAttachmentsInternal, {
+    briefId,
+  });
+
+  let text = "";
+  const images: AttachmentInfo[] = [];
+  const names: string[] = [];
+
+  for (const att of attachments) {
+    names.push(att.name);
+    if (att.kind === "image") {
+      images.push(att);
+      continue;
+    }
+    if (att.kind !== "text") continue;
+    const blob = await ctx.storage.get(att.storageId);
+    if (!blob) continue;
+    const buf = Buffer.from(await blob.arrayBuffer());
+    const extracted = await extractTextFromBuffer(buf, att.mimeType, att.name);
+    if (extracted.trim()) {
+      text += `\n\n--- File: ${att.name} ---\n${extracted}`;
+    }
+  }
+
+  return { text: text.slice(0, MAX_ATTACHMENT_TEXT), images, names };
+}
 
 // ---------------------------------------------------------------------------
 // Small HTTP helpers (timeout + bounded retry)
@@ -75,6 +152,10 @@ type ChatMessage = {
   content: string;
 };
 
+type VisionPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 async function callChat(
   messages: ChatMessage[],
   opts: { maxTokens?: number } = {},
@@ -107,8 +188,55 @@ async function callChat(
   return text;
 }
 
+// Chat call that includes images (vision) alongside the text prompt.
+async function callChatVision(
+  messages: {
+    role: "system" | "user";
+    content: string | VisionPart[];
+  }[],
+): Promise<string> {
+  const res = await fetchWithRetry(`${XPL_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${XPL_KEY}`,
+    },
+    body: JSON.stringify({
+      model: XPL_MODEL,
+      messages,
+      temperature: 0.4,
+      max_tokens: 2200,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `Experiential Labs chat failed (${res.status}): ${body.slice(0, 300)}`,
+    );
+  }
+  const data = (await res.json()) as {
+    choices?: { message?: { content?: string } }[];
+  };
+  const text = data.choices?.[0]?.message?.content;
+  if (!text) throw new Error("LLM returned no content");
+  return text;
+}
+
 async function callChatJson<T>(messages: ChatMessage[]): Promise<T> {
   const raw = await callChat(messages);
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1) throw new Error("Model returned no JSON");
+  return JSON.parse(raw.slice(start, end + 1)) as T;
+}
+
+async function callChatJsonVision<T>(
+  messages: {
+    role: "system" | "user";
+    content: string | VisionPart[];
+  }[],
+): Promise<T> {
+  const raw = await callChatVision(messages);
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
   if (start === -1 || end === -1) throw new Error("Model returned no JSON");
@@ -194,21 +322,44 @@ async function generateSheet(
 const STYLE_ANCHOR =
   "Single flat infographic reference sheet for a 3D modeling team, clean vector-style illustration with soft clay-like matte rendering, pastel color palette, no photo backgrounds, no watermark, no text gibberish";
 
-function extractionMessages(brief: string): ChatMessage[] {
+function buildBriefBlock(
+  brief: string,
+  attachmentsText: string,
+  attachmentNames: string[],
+): string {
+  const parts: string[] = [];
+  if (brief.trim()) parts.push(`Brief text:\n"""\n${brief}\n"""`);
+  if (attachmentsText.trim())
+    parts.push(`Attached document contents:\n${attachmentsText}`);
+  if (attachmentNames.length > 0)
+    parts.push(
+      `Files attached to this brief: ${attachmentNames.join(", ")}$`,
+    );
+  return parts.join("\n\n");
+}
+
+function extractionMessages(
+  briefBlock: string,
+  hasImages: boolean,
+): ChatMessage[] {
   return [
     {
       role: "system",
-      content:
-        "You are a 3D visualization lead at an event production company. From the raw client brief, extract ONLY information needed to build a 3D model of the event. Ignore catering menus, pricing, contracts, guest lists, scheduling, entertainment bookings, marketing copy, and anything else that does not affect geometry, staging, layout, materials, colors, lighting, AV placement, or branding surfaces. If a field is not mentioned, omit it. Reply with JSON only — no prose, no markdown fences.",
+      content: `You are a 3D visualization lead at an event production company. From the raw client brief${
+        hasImages ? " (including attached reference/logos/venue images)" : ""
+      }, extract ONLY information needed to build a 3D model of the event. Ignore catering menus, pricing, contracts, guest lists, scheduling, entertainment bookings, marketing copy, and anything else that does not affect geometry, staging, layout, materials, colors, lighting, AV placement, or branding surfaces. If a field is not mentioned, omit it. Reply with JSON only — no prose, no markdown fences.`,
     },
     {
       role: "user",
-      content: `Brief:\n"""\n${brief}\n"""\n\nReturn JSON with this exact shape (omit unknown fields, keep strings concise):\n{"eventName":string,"eventType":string,"venue":string,"dimensions":string,"staging":string,"lighting":string,"av":string,"seating":string,"branding":string,"layoutNotes":string,"objects":string[],"ignored":string}`,
+      content: `${briefBlock}\n\nReturn JSON with this exact shape (omit unknown fields, keep strings concise):\n{"eventName":string,"eventType":string,"venue":string,"dimensions":string,"staging":string,"lighting":string,"av":string,"seating":string,"branding":string,"layoutNotes":string,"objects":string[],"ignored":string}`,
     },
   ];
 }
 
-function planningMessages(brief: string, extractedJson: string): ChatMessage[] {
+function planningMessages(
+  briefBlock: string,
+  extractedJson: string,
+): ChatMessage[] {
   return [
     {
       role: "system",
@@ -217,7 +368,7 @@ function planningMessages(brief: string, extractedJson: string): ChatMessage[] {
     },
     {
       role: "user",
-      content: `Brief:\n"""\n${brief}\n"""\n\nExtracted 3D info:\n${extractedJson}\n\nReturn JSON:\n{"chunks":[{"name":string,"goal":string,"spec":string}]}\n"spec" must be a detailed modeling instruction for that part: geometry, approximate dimensions, materials, colors, placement relative to the venue, and any branding/graphics to apply.`,
+      content: `${briefBlock}\n\nExtracted 3D info:\n${extractedJson}\n\nReturn JSON:\n{"chunks":[{"name":string,"goal":string,"spec":string}]}\n"spec" must be a detailed modeling instruction for that part: geometry, approximate dimensions, materials, colors, placement relative to the venue, and any branding/graphics to apply.`,
     },
   ];
 }
@@ -270,14 +421,53 @@ export const runPipeline = internalAction({
     if (!brief) throw new Error(`Brief ${briefId} not found`);
 
     try {
+      // ---- Load attachments (PDFs, docs, images) ------------------------
+      const { text: attachmentsText, images, names: attachmentNames } =
+        await loadBriefContext(ctx, briefId);
+      const briefBlock = buildBriefBlock(
+        brief.rawText,
+        attachmentsText,
+        attachmentNames,
+      );
+
       // ---- Stage 1: extract 3D-only info --------------------------------
       await ctx.runMutation(internal.briefs.setStatus, {
         briefId,
         status: "extracting",
       });
-      const extracted = await callChatJson<Record<string, unknown>>(
-        extractionMessages(brief.rawText),
-      );
+      let extracted: Record<string, unknown>;
+      if (images.length > 0) {
+        // Include attached images as vision content for logo/brand/venue refs.
+        const imageParts: VisionPart[] = [];
+        for (const img of images.slice(0, 8)) {
+          const blob = await ctx.storage.get(img.storageId);
+          if (!blob) continue;
+          const b64 = Buffer.from(await blob.arrayBuffer()).toString("base64");
+          imageParts.push({
+            type: "image_url",
+            image_url: { url: `data:${img.mimeType};base64,${b64}` },
+          });
+        }
+        extracted = await callChatJsonVision<Record<string, unknown>>(
+          [
+            {
+              role: "system",
+              content: extractionMessages(briefBlock, true)[0].content,
+            },
+            {
+              role: "user",
+              content: [
+                { type: "text", text: extractionMessages(briefBlock, true)[1].content as string },
+                ...imageParts,
+              ],
+            },
+          ],
+        );
+      } else {
+        extracted = await callChatJson<Record<string, unknown>>(
+          extractionMessages(briefBlock, false),
+        );
+      }
       await ctx.runMutation(internal.briefs.setExtracted, {
         briefId,
         extracted,
@@ -291,10 +481,7 @@ export const runPipeline = internalAction({
       const plan = await callChatJson<{
         chunks: { name: string; goal: string; spec: string }[];
       }>(
-        planningMessages(
-          brief.rawText,
-          JSON.stringify(extracted).slice(0, 4000),
-        ),
+        planningMessages(briefBlock, JSON.stringify(extracted).slice(0, 4000)),
       );
       const chunkDefs = (plan.chunks ?? []).slice(0, MAX_CHUNKS);
       if (chunkDefs.length === 0) throw new Error("Planner returned no chunks");
@@ -398,18 +585,6 @@ export const runPipeline = internalAction({
         briefId,
         storageId: summaryStorageId,
       });
-
-      // ---- Best-effort archive to Supabase (never blocks the result) -----
-      try {
-        await ctx.runAction(internal.supabaseArchive.archiveBrief, {
-          briefId,
-        });
-      } catch (archiveErr) {
-        console.error(
-          "Supabase archive failed (brief result is still complete):",
-          archiveErr,
-        );
-      }
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Unknown pipeline error";

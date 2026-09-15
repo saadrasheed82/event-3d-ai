@@ -56,6 +56,20 @@ const schema = defineSchema(
 
     // add other tables here
 
+    attachments: defineTable({
+      briefId: v.id("briefs"),
+      name: v.string(),
+      mimeType: v.string(),
+      size: v.number(),
+      storageId: v.id("_storage"),
+      kind: v.union(
+        v.literal("text"), // extractable text: pdf, docx, txt, md, csv
+        v.literal("image"), // sent to the LLM as vision input
+        v.literal("other"), // stored, shown in UI, not machine-read
+      ),
+      extractedText: v.optional(v.string()),
+    }).index("by_brief", ["briefId", "name"]),
+
     briefs: defineTable({
       userId: v.id("users"),
       title: v.string(),
