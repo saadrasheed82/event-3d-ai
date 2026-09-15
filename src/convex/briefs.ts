@@ -183,6 +183,17 @@ export const replaceChunks = internalMutation({
   },
 });
 
+export const getAllChunksInternal = internalQuery({
+  args: { briefId: v.id("briefs") },
+  handler: async (ctx, { briefId }) => {
+    return await ctx.db
+      .query("chunks")
+      .withIndex("by_brief", (q) => q.eq("briefId", briefId))
+      .order("asc")
+      .collect();
+  },
+});
+
 export const getChunkByIndex = internalQuery({
   args: {
     briefId: v.id("briefs"),

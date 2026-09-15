@@ -398,6 +398,18 @@ export const runPipeline = internalAction({
         briefId,
         storageId: summaryStorageId,
       });
+
+      // ---- Best-effort archive to Supabase (never blocks the result) -----
+      try {
+        await ctx.runAction(internal.supabaseArchive.archiveBrief, {
+          briefId,
+        });
+      } catch (archiveErr) {
+        console.error(
+          "Supabase archive failed (brief result is still complete):",
+          archiveErr,
+        );
+      }
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Unknown pipeline error";
